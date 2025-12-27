@@ -1,0 +1,954 @@
+diff --git a/internal/engine/interpreter/race_condition__HABITAT_test.go b/internal/engine/interpreter/race_condition__HABITAT_test.go
+new file mode 100644
+index 00000000..196ca5c8
+--- /dev/null
++++ b/internal/engine/interpreter/race_condition__HABITAT_test.go
+@@ -0,0 +1,464 @@
++package interpreter
++
++import (
++	"context"
++	"runtime"
++	"sync"
++	"sync/atomic"
++	"testing"
++
++	"github.com/tetratelabs/wazero/api"
++	"github.com/tetratelabs/wazero/internal/wasm"
++	"github.com/stretchr/testify/require"
++)
++
++// TestRaceConditionInCompiledFunctions_HABITAT tests the race condition fix for concurrent function compilation.
++func TestRaceConditionInCompiledFunctions_HABITAT(t *testing.T) {
++	const (
++		numGoroutines = 30
++		numModules    = 5
++		numIterations = 50
++	)
++
++	ctx := context.Background()
++	e := NewEngine(ctx, api.CoreFeaturesV1, nil).(*engine)
++	require.NotNil(t, e)
++
++	// Create test modules
++	modules := make([]*wasm.Module, numModules)
++	for i := 0; i < numModules; i++ {
++		modules[i] = &wasm.Module{
++			ID: wasm.ModuleID{byte(i)},
++			TypeSection: []wasm.FunctionType{{}},
++			FunctionSection: []wasm.Index{0, 0, 0, 0},
++			CodeSection: []wasm.Code{
++				{Body: []byte{wasm.OpcodeEnd}},
++				{Body: []byte{wasm.OpcodeEnd}},
++				{Body: []byte{wasm.OpcodeEnd}},
++				{Body: []byte{wasm.OpcodeEnd}},
++			},
++		}
++	}
++
++	var wg sync.WaitGroup
++	var mu sync.Mutex
++	compiledFunctions := make(map[wasm.ModuleID][]compiledFunction)
++	var operations atomic.Int64
++
++	// Launch many goroutines that simultaneously compile functions for the same modules
++	for i := 0; i < numGoroutines; i++ {
++		wg.Add(1)
++		go func(goroutineID int) {
++			defer wg.Done()
++
++			for j := 0; j < numIterations; j++ {
++				moduleIndex := goroutineID % numModules
++				module := modules[moduleIndex]
++
++				operations.Add(1)
++
++				// Create compiled functions with unique identifiers
++				functions := make([]compiledFunction, 4)
++				for k := range functions {
++					functions[k] = compiledFunction{
++						code:     make([]byte, 128),
++						gasCost:  uint64(k + goroutineID*100),
++						localCnt: uint32(k),
++					}
++					// Add unique identifier
++					functions[k].code[0] = byte(goroutineID)
++				}
++
++				// Add to cache - this is where the race condition occurs
++				e.addCompiledFunctions(module, functions)
++
++				// Verify the functions were added correctly
++				retrievedFunctions, ok := e.getCompiledFunctions(module, false)
++				require.True(t, ok, "Functions should be in cache after compilation")
++				require.Len(t, retrievedFunctions, 4, "Should have 4 functions")
++
++				mu.Lock()
++				compiledFunctions[module.ID] = retrievedFunctions
++				mu.Unlock()
++
++				// Simulate some work to increase chance of race conditions
++				runtime.Gosched()
++			}
++		}(i)
++	}
++
++	wg.Wait()
++
++	t.Logf("Total operations: %d", operations.Load())
++
++	// Verify all modules have compiled functions
++	mu.Lock()
++	require.Len(t, compiledFunctions, numModules, "All modules should have compiled functions")
++	mu.Unlock()
++
++	// Verify reference counts are correct
++	e.mux.RLock()
++	for moduleID, cfWithCount := range e.compiledFunctions {
++		require.Greater(t, cfWithCount.refCount, 0, "Reference count should be positive for module %v", moduleID)
++		require.Len(t, cfWithCount.funcs, 4, "Should have 4 functions")
++
++		// Verify all functions for a module are identical (first one wins)
++		firstFunc := cfWithCount.funcs[0]
++		for _, f := range cfWithCount.funcs {
++			require.Equal(t, firstFunc.code[0], f.code[0], "All functions should be from the same goroutine")
++		}
++	}
++	e.mux.RUnlock()
++}
++
++// TestConcurrentFunctionCompilationWithReferenceCounting_HABITAT tests complex scenarios with reference counting.
++func TestConcurrentFunctionCompilationWithReferenceCounting_HABITAT(t *testing.T) {
++	const (
++		numGoroutines = 20
++		numModules    = 3
++		numIterations = 25
++	)
++
++	ctx := context.Background()
++	e := NewEngine(ctx, api.CoreFeaturesV1, nil).(*engine)
++	require.NotNil(t, e)
++
++	// Create test modules
++	modules := make([]*wasm.Module, numModules)
++	for i := 0; i < numModules; i++ {
++		modules[i] = &wasm.Module{
++			ID: wasm.ModuleID{byte(i)},
++			TypeSection: []wasm.FunctionType{{}},
++			FunctionSection: []wasm.Index{0, 0, 0},
++			CodeSection: []wasm.Code{
++				{Body: []byte{wasm.OpcodeEnd}},
++				{Body: []byte{wasm.OpcodeEnd}},
++				{Body: []byte{wasm.OpcodeEnd}},
++			},
++		}
++	}
++
++	var wg sync.WaitGroup
++	var operations atomic.Int64
++
++	// Test concurrent compilation, retrieval, and deletion
++	for i := 0; i < numGoroutines; i++ {
++		wg.Add(1)
++		go func(goroutineID int) {
++			defer wg.Done()
++
++			for j := 0; j < numIterations; j++ {
++				moduleIndex := goroutineID % numModules
++				module := modules[moduleIndex]
++
++				operations.Add(1)
++
++				// Randomly choose operation type
++				operationType := (goroutineID + j) % 3
++
++				switch operationType {
++				case 0: // Compile functions
++					functions := make([]compiledFunction, 3)
++					for k := range functions {
++						functions[k] = compiledFunction{
++							code:     make([]byte, 64),
++							gasCost:  uint64(k),
++							localCnt: uint32(k),
++						}
++						functions[k].code[0] = byte(goroutineID)
++					}
++
++					e.addCompiledFunctions(module, functions)
++
++				case 1: // Get functions (increase ref count)
++					funcs, ok := e.getCompiledFunctions(module, true)
++					if ok {
++						require.Len(t, funcs, 3, "Should have 3 functions")
++					}
++
++				case 2: // Get functions (don't increase ref count)
++					funcs, ok := e.getCompiledFunctions(module, false)
++					if ok {
++						require.Len(t, funcs, 3, "Should have 3 functions")
++					}
++				}
++
++				// Add some randomness in timing
++				if j%5 == 0 {
++					runtime.Gosched()
++				}
++			}
++		}(i)
++	}
++
++	wg.Wait()
++
++	t.Logf("Operations: %d", operations.Load())
++
++	// Verify cache consistency
++	e.mux.RLock()
++	defer e.mux.RUnlock()
++
++	for moduleID, cfWithCount := range e.compiledFunctions {
++		require.Greater(t, cfWithCount.refCount, 0, "Reference count should be positive for module %v", moduleID)
++		require.Len(t, cfWithCount.funcs, 3, "Should have 3 functions")
++
++		// Verify function integrity
++		for _, f := range cfWithCount.funcs {
++			require.NotNil(t, f.code, "Function code should not be nil")
++			require.Greater(t, len(f.code), 0, "Function code should not be empty")
++		}
++	}
++}
++
++// TestFunctionCompilationRaceConditionStressTest_HABITAT is an extreme stress test.
++func TestFunctionCompilationRaceConditionStressTest_HABITAT(t *testing.T) {
++	if testing.Short() {
++		t.Skip("Skipping stress test in short mode")
++	}
++
++	const (
++		numGoroutines = 50
++		numModules    = 5
++		numIterations = 100
++	)
++
++	ctx := context.Background()
++	e := NewEngine(ctx, api.CoreFeaturesV1, nil).(*engine)
++	require.NotNil(t, e)
++
++	// Create test modules
++	modules := make([]*wasm.Module, numModules)
++	for i := 0; i < numModules; i++ {
++		numFunctions := (i % 3) + 2
++		functions := make([]wasm.Index, numFunctions)
++		codes := make([]wasm.Code, numFunctions)
++
++		for j := 0; j < numFunctions; j++ {
++			functions[j] = wasm.Index(j)
++			codes[j] = wasm.Code{Body: []byte{wasm.OpcodeEnd}}
++		}
++
++		modules[i] = &wasm.Module{
++			ID:             wasm.ModuleID{byte(i)},
++			TypeSection:    []wasm.FunctionType{{}},
++			FunctionSection: functions,
++			CodeSection:    codes,
++		}
++	}
++
++	var (
++		wg           sync.WaitGroup
++		operations   atomic.Int64
++		cacheHits    atomic.Int64
++		compilations atomic.Int64
++	)
++
++	// Start stress test goroutines
++	for i := 0; i < numGoroutines; i++ {
++		wg.Add(1)
++		go func(goroutineID int) {
++			defer wg.Done()
++
++			for j := 0; j < numIterations; j++ {
++				moduleIndex := goroutineID % numModules
++				module := modules[moduleIndex]
++
++				operations.Add(1)
++
++				// Try to get from cache first
++				funcs, ok := e.getCompiledFunctions(module, false)
++				if ok {
++					cacheHits.Add(1)
++
++					// Occasionally increase ref count
++					if goroutineID%3 == 0 {
++						funcs, ok = e.getCompiledFunctions(module, true)
++						require.True(t, ok)
++					}
++				} else {
++					// Compile new functions
++					compilations.Add(1)
++
++					newFuncs := make([]compiledFunction, len(module.FunctionSection))
++					for k := range newFuncs {
++						newFuncs[k] = compiledFunction{
++							code:     make([]byte, 32+goroutineID),
++							gasCost:  uint64(k),
++							localCnt: uint32(k),
++						}
++						newFuncs[k].code[0] = byte(goroutineID)
++					}
++
++					e.addCompiledFunctions(module, newFuncs)
++				}
++
++				// Random micro-sleep to increase chance of race conditions
++				if goroutineID%7 == 0 {
++					runtime.Gosched()
++				}
++			}
++		}(i)
++	}
++
++	wg.Wait()
++
++	t.Logf("Stress test completed")
++	t.Logf("Operations: %d, Cache hits: %d, Compilations: %d",
++		operations.Load(), cacheHits.Load(), compilations.Load())
++
++	// Verify final cache state
++	e.mux.RLock()
++	defer e.mux.RUnlock()
++
++	require.Greater(t, len(e.compiledFunctions), 0, "Cache should contain some functions")
++
++	for moduleID, cfWithCount := range e.compiledFunctions {
++		require.Greater(t, cfWithCount.refCount, 0, "Reference count should be positive for module %v", moduleID)
++		require.Len(t, cfWithCount.funcs, len(modules[moduleID[0]].FunctionSection), "Should have correct number of functions")
++
++		// Verify function integrity
++		for _, f := range cfWithCount.funcs {
++			require.NotNil(t, f.code, "Function code should not be nil")
++			require.Greater(t, len(f.code), 0, "Function code should not be empty")
++		}
++	}
++}
++
++// TestSameModuleConcurrentCompilation_HABITAT tests the exact race condition scenario.
++func TestSameModuleConcurrentCompilation_HABITAT(t *testing.T) {
++	ctx := context.Background()
++	e := NewEngine(ctx, api.CoreFeaturesV1, nil).(*engine)
++	require.NotNil(t, e)
++
++	module := &wasm.Module{
++		ID:             wasm.ModuleID{0x88},
++		TypeSection:    []wasm.FunctionType{{}},
++		FunctionSection: []wasm.Index{0, 0, 0, 0},
++		CodeSection: []wasm.Code{
++			{Body: []byte{wasm.OpcodeEnd}},
++			{Body: []byte{wasm.OpcodeEnd}},
++			{Body: []byte{wasm.OpcodeEnd}},
++			{Body: []byte{wasm.OpcodeEnd}},
++		},
++	}
++
++	const numGoroutines = 25
++	var wg sync.WaitGroup
++	var results [][]compiledFunction
++	var mu sync.Mutex
++
++	// All goroutines try to compile the same module simultaneously
++	for i := 0; i < numGoroutines; i++ {
++		wg.Add(1)
++		go func(goroutineID int) {
++			defer wg.Done()
++
++			// Create unique compiled functions for this goroutine
++			functions := make([]compiledFunction, 4)
++			for k := range functions {
++				functions[k] = compiledFunction{
++					code:     make([]byte, 64),
++					gasCost:  uint64(k + goroutineID*1000),
++					localCnt: uint32(k),
++				}
++				// Add unique identifier
++				functions[k].code[0] = byte(goroutineID)
++				functions[k].code[1] = byte(k)
++			}
++
++			// Add to cache
++			e.addCompiledFunctions(module, functions)
++
++			// Get result for verification
++			retrievedFunctions, ok := e.getCompiledFunctions(module, false)
++			require.True(t, ok)
++
++			// Store result for verification
++			mu.Lock()
++			results = append(results, retrievedFunctions)
++			mu.Unlock()
++		}(i)
++	}
++
++	wg.Wait()
++
++	// All results should be identical (first one wins)
++	require.Len(t, results, numGoroutines)
++	firstFuncs := results[0]
++	for i, funcs := range results {
++		require.Equal(t, len(firstFuncs), len(funcs), "Result %d should have same number of functions", i)
++		for j, f := range funcs {
++			require.Equal(t, firstFuncs[j].code[0], f.code[0], "Function %d in result %d should be from the same goroutine", j, i)
++			require.Equal(t, firstFuncs[j].code[1], f.code[1], "Function %d in result %d should have same index", j, i)
++		}
++	}
++
++	// Verify reference count is correct
++	e.mux.RLock()
++	cfWithCount := e.compiledFunctions[module.ID]
++	require.Equal(t, numGoroutines, cfWithCount.refCount, "Reference count should equal number of goroutines")
++	require.Len(t, cfWithCount.funcs, 4)
++	e.mux.RUnlock()
++
++	// Verify the function content is from the first goroutine
++	require.Equal(t, byte(0), firstFuncs[0].code[0], "Should be from goroutine 0")
++	require.Equal(t, byte(0), firstFuncs[0].code[1], "Should be function 0")
++}
++
++// TestFunctionCompilationIntegrity_HABITAT verifies that function compilation maintains integrity under concurrent access.
++func TestFunctionCompilationIntegrity_HABITAT(t *testing.T) {
++	ctx := context.Background()
++	e := NewEngine(ctx, api.CoreFeaturesV1, nil).(*engine)
++	require.NotNil(t, e)
++
++	module := &wasm.Module{
++		ID:             wasm.ModuleID{0x77},
++		TypeSection:    []wasm.FunctionType{{}},
++		FunctionSection: []wasm.Index{0, 0, 0},
++		CodeSection: []wasm.Code{
++			{Body: []byte{wasm.OpcodeEnd}},
++			{Body: []byte{wasm.OpcodeEnd}},
++			{Body: []byte{wasm.OpcodeEnd}},
++		},
++	}
++
++	// First goroutine compiles functions
++	functions1 := make([]compiledFunction, 3)
++	for i := range functions1 {
++		functions1[i] = compiledFunction{
++			code:     []byte{0x01, 0x02, 0x03, byte(i)},
++			gasCost:  uint64(i * 100),
++			localCnt: uint32(i * 10),
++		}
++	}
++	e.addCompiledFunctions(module, functions1)
++
++	// Second goroutine tries to compile different functions
++	functions2 := make([]compiledFunction, 3)
++	for i := range functions2 {
++		functions2[i] = compiledFunction{
++			code:     []byte{0x04, 0x05, 0x06, byte(i)},
++			gasCost:  uint64(i * 200),
++			localCnt: uint32(i * 20),
++		}
++	}
++	e.addCompiledFunctions(module, functions2)
++
++	// Verify the first functions are still there (reference count incremented)
++	retrievedFunctions, ok := e.getCompiledFunctions(module, false)
++	require.True(t, ok)
++	require.Len(t, retrievedFunctions, 3)
++
++	for i, f := range retrievedFunctions {
++		require.Equal(t, []byte{0x01, 0x02, 0x03, byte(i)}, f.code, "Function %d should be from first compilation", i)
++		require.Equal(t, uint64(i*100), f.gasCost, "Function %d gas cost should be from first compilation", i)
++		require.Equal(t, uint32(i*10), f.localCnt, "Function %d local count should be from first compilation", i)
++	}
++
++	// Verify reference count is 2
++	e.mux.RLock()
++	cfWithCount := e.compiledFunctions[module.ID]
++	require.Equal(t, 2, cfWithCount.refCount, "Reference count should be 2")
++	e.mux.RUnlock()
++}
+diff --git a/internal/engine/wazevo/race_condition__HABITAT_test.go b/internal/engine/wazevo/race_condition__HABITAT_test.go
+new file mode 100644
+index 00000000..efc77812
+--- /dev/null
++++ b/internal/engine/wazevo/race_condition__HABITAT_test.go
+@@ -0,0 +1,478 @@
++package wazevo
++
++import (
++	"context"
++	"fmt"
++	"runtime"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"github.com/tetratelabs/wazero/api"
++	"github.com/tetratelabs/wazero/experimental"
++	"github.com/tetratelabs/wazero/internal/engine/wazevo/wazevoapi"
++	"github.com/tetratelabs/wazero/internal/wasm"
++	"github.com/stretchr/testify/require"
++)
++
++// TestRaceConditionInModuleCompilation_HABITAT tests the race condition fix for concurrent module compilation.
++// This test creates extreme concurrent scenarios that would expose the race condition in the original implementation.
++func TestRaceConditionInModuleCompilation_HABITAT(t *testing.T) {
++	const (
++		numGoroutines = 50
++		numModules    = 10
++		numIterations = 100
++	)
++
++	ctx := context.Background()
++	e := NewEngine(ctx, api.CoreFeaturesV1, nil).(*engine)
++	require.NotNil(t, e)
++
++	// Create test modules
++	modules := make([]*wasm.Module, numModules)
++	for i := 0; i < numModules; i++ {
++		modules[i] = &wasm.Module{
++			ID: wasm.ModuleID{byte(i)},
++			TypeSection: []wasm.FunctionType{{}},
++			FunctionSection: []wasm.Index{0, 0, 0, 0},
++			CodeSection: []wasm.Code{
++				{Body: []byte{wasm.OpcodeEnd}},
++				{Body: []byte{wasm.OpcodeEnd}},
++				{Body: []byte{wasm.OpcodeEnd}},
++				{Body: []byte{wasm.OpcodeEnd}},
++			},
++		}
++	}
++
++	// Track compilation attempts and successes
++	var compilationAttempts, compilationSuccesses, cacheHits atomic.Int64
++	var wg sync.WaitGroup
++	var mu sync.Mutex
++	compiledModules := make(map[wasm.ModuleID]*compiledModule)
++
++	// Launch many goroutines that simultaneously compile the same modules
++	for i := 0; i < numGoroutines; i++ {
++		wg.Add(1)
++		go func(goroutineID int) {
++			defer wg.Done()
++
++			for j := 0; j < numIterations; j++ {
++				moduleIndex := goroutineID % numModules
++				module := modules[moduleIndex]
++
++				compilationAttempts.Add(1)
++
++				// Try to get compiled module
++				cm, ok, err := e.getCompiledModule(nil, false)
++				require.False(t, ok)
++				require.NoError(t, err)
++
++				// Simulate compilation by creating a new compiled module
++				newCm := &compiledModule{
++					executables: &executables{
++						executable:     make([]byte, 1024),
++						entryPreambles: make([]byte, 256),
++					},
++					functionOffsets: make([]int, 4),
++					module:          module,
++					parent:          e,
++				}
++
++				// Add to cache - this is where the race condition occurs
++				err = e.addCompiledModule(module, newCm)
++				require.NoError(t, err)
++				compilationSuccesses.Add(1)
++
++				// Verify the module was added correctly
++				retrievedCm, ok := e.getCompiledModuleFromMemory(module, false)
++				require.True(t, ok, "Module should be in cache after compilation")
++				require.NotNil(t, retrievedCm)
++
++				mu.Lock()
++				compiledModules[module.ID] = retrievedCm
++				mu.Unlock()
++
++				// Simulate some work
++				runtime.Gosched()
++			}
++		}(i)
++	}
++
++	wg.Wait()
++
++	// Verify all modules were compiled
++	mu.Lock()
++	require.Len(t, compiledModules, numModules, "All modules should be compiled")
++	mu.Unlock()
++
++	// Verify reference counts are correct
++	e.mux.RLock()
++	for moduleID, cmWithCount := range e.compiledModules {
++		require.Greater(t, cmWithCount.refCount, 0, "Reference count should be positive for module %v", moduleID)
++		require.NotNil(t, cmWithCount.compiledModule, "Compiled module should not be nil")
++	}
++	e.mux.RUnlock()
++
++	t.Logf("Compilation attempts: %d, successes: %d", compilationAttempts.Load(), compilationSuccesses.Load())
++}
++
++// TestConcurrentModuleCompilationWithReferenceCounting_HABITAT tests complex scenarios with reference counting.
++func TestConcurrentModuleCompilationWithReferenceCounting_HABITAT(t *testing.T) {
++	const (
++		numGoroutines = 20
++		numModules    = 3
++		numIterations = 25
++	)
++
++	ctx := context.Background()
++	e := NewEngine(ctx, api.CoreFeaturesV1, nil).(*engine)
++	require.NotNil(t, e)
++
++	// Create test modules
++	modules := make([]*wasm.Module, numModules)
++	for i := 0; i < numModules; i++ {
++		modules[i] = &wasm.Module{
++			ID: wasm.ModuleID{byte(i)},
++			TypeSection: []wasm.FunctionType{{}},
++			FunctionSection: []wasm.Index{0, 0},
++			CodeSection: []wasm.Code{
++				{Body: []byte{wasm.OpcodeEnd}},
++				{Body: []byte{wasm.OpcodeEnd}},
++			},
++		}
++	}
++
++	var wg sync.WaitGroup
++	var operations atomic.Int64
++	var errors atomic.Int64
++
++	// Test concurrent compilation, retrieval, and deletion
++	for i := 0; i < numGoroutines; i++ {
++		wg.Add(1)
++		go func(goroutineID int) {
++			defer wg.Done()
++
++			for j := 0; j < numIterations; j++ {
++				moduleIndex := goroutineID % numModules
++				module := modules[moduleIndex]
++
++				operations.Add(1)
++
++				// Randomly choose operation type
++				operationType := (goroutineID + j) % 4
++
++				switch operationType {
++				case 0: // Compile module
++					newCm := &compiledModule{
++						executables: &executables{
++							executable:     make([]byte, 512),
++							entryPreambles: make([]byte, 128),
++						},
++						functionOffsets: make([]int, 2),
++						module:          module,
++						parent:          e,
++					}
++
++					err := e.addCompiledModule(module, newCm)
++					if err != nil {
++						errors.Add(1)
++					}
++
++				case 1: // Get module (increase ref count)
++					cm, ok := e.getCompiledModuleFromMemory(module, true)
++					if ok && cm != nil {
++						// Verify module integrity
++						require.Equal(t, module.ID, cm.module.ID)
++					}
++
++				case 2: // Get module (don't increase ref count)
++					cm, ok := e.getCompiledModuleFromMemory(module, false)
++					if ok && cm != nil {
++						require.Equal(t, module.ID, cm.module.ID)
++					}
++
++				case 3: // Delete module (if ref count is 1)
++					e.mux.RLock()
++					if cmWithCount, exists := e.compiledModules[module.ID]; exists && cmWithCount.refCount == 1 {
++						e.mux.RUnlock()
++						e.DeleteCompiledModule(module)
++					} else {
++						e.mux.RUnlock()
++					}
++				}
++
++				// Add some randomness in timing
++				if j%5 == 0 {
++					time.Sleep(time.Microsecond)
++				}
++			}
++		}(i)
++	}
++
++	wg.Wait()
++
++	t.Logf("Operations: %d, Errors: %d", operations.Load(), errors.Load())
++
++	// Verify cache consistency
++	e.mux.RLock()
++	defer e.mux.RUnlock()
++
++	for moduleID, cmWithCount := range e.compiledModules {
++		require.Greater(t, cmWithCount.refCount, 0, "Reference count should be positive for module %v", moduleID)
++		require.NotNil(t, cmWithCount.compiledModule, "Compiled module should not be nil")
++		require.Equal(t, moduleID, cmWithCount.compiledModule.module.ID, "Module ID should match")
++	}
++}
++
++// TestRaceConditionWithStressTest_HABITAT is an extreme stress test that combines multiple race condition scenarios.
++func TestRaceConditionWithStressTest_HABITAT(t *testing.T) {
++	if testing.Short() {
++		t.Skip("Skipping stress test in short mode")
++	}
++
++	const (
++		numGoroutines = 100
++		numModules    = 10
++		testDuration  = 5 * time.Second
++	)
++
++	ctx := context.Background()
++	e := NewEngine(ctx, api.CoreFeaturesV1, nil).(*engine)
++	require.NotNil(t, e)
++
++	// Create test modules with varying complexity
++	modules := make([]*wasm.Module, numModules)
++	for i := 0; i < numModules; i++ {
++		numFunctions := (i % 5) + 1
++		functions := make([]wasm.Index, numFunctions)
++		codes := make([]wasm.Code, numFunctions)
++
++		for j := 0; j < numFunctions; j++ {
++			functions[j] = wasm.Index(j)
++			codes[j] = wasm.Code{Body: []byte{wasm.OpcodeEnd}}
++		}
++
++		modules[i] = &wasm.Module{
++			ID:             wasm.ModuleID{byte(i)},
++			TypeSection:    []wasm.FunctionType{{}},
++			FunctionSection: functions,
++			CodeSection:    codes,
++		}
++	}
++
++	var (
++		wg           sync.WaitGroup
++		stop         atomic.Bool
++		operations   atomic.Int64
++		errors       atomic.Int64
++		cacheHits    atomic.Int64
++		compilations atomic.Int64
++	)
++
++	// Start stress test goroutines
++	for i := 0; i < numGoroutines; i++ {
++		wg.Add(1)
++		go func(goroutineID int) {
++			defer wg.Done()
++
++			for !stop.Load() {
++				moduleIndex := goroutineID % numModules
++				module := modules[moduleIndex]
++
++				operations.Add(1)
++
++				// Try to get from cache first
++				cm, ok := e.getCompiledModuleFromMemory(module, false)
++				if ok {
++					cacheHits.Add(1)
++
++					// Occasionally increase ref count
++					if goroutineID%3 == 0 {
++						cm, ok = e.getCompiledModuleFromMemory(module, true)
++						require.True(t, ok)
++					}
++				} else {
++					// Compile new module
++					compilations.Add(1)
++
++					newCm := &compiledModule{
++						executables: &executables{
++							executable:     make([]byte, 256+goroutineID),
++							entryPreambles: make([]byte, 64),
++						},
++						functionOffsets: make([]int, len(module.FunctionSection)),
++						module:          module,
++						parent:          e,
++					}
++
++					err := e.addCompiledModule(module, newCm)
++					if err != nil {
++						errors.Add(1)
++					}
++				}
++
++				// Random micro-sleep to increase chance of race conditions
++				if goroutineID%7 == 0 {
++					runtime.Gosched()
++				}
++			}
++		}(i)
++	}
++
++	// Run for specified duration
++	time.Sleep(testDuration)
++	stop.Store(true)
++	wg.Wait()
++
++	t.Logf("Stress test completed in %v", testDuration)
++	t.Logf("Operations: %d, Cache hits: %d, Compilations: %d, Errors: %d",
++		operations.Load(), cacheHits.Load(), compilations.Load(), errors.Load())
++
++	// Verify final cache state
++	e.mux.RLock()
++	defer e.mux.RUnlock()
++
++	require.Greater(t, len(e.compiledModules), 0, "Cache should contain some modules")
++
++	for moduleID, cmWithCount := range e.compiledModules {
++		require.Greater(t, cmWithCount.refCount, 0, "Reference count should be positive for module %v", moduleID)
++		require.NotNil(t, cmWithCount.compiledModule, "Compiled module should not be nil")
++
++		// Verify module integrity
++		require.Equal(t, moduleID, cmWithCount.compiledModule.module.ID)
++		require.NotNil(t, cmWithCount.compiledModule.executables)
++		require.NotNil(t, cmWithCount.compiledModule.functionOffsets)
++	}
++}
++
++// TestModuleCompilationReturnValues_HABITAT specifically tests that addCompiledModule returns the correct module.
++func TestModuleCompilationReturnValues_HABITAT(t *testing.T) {
++	ctx := context.Background()
++	e := NewEngine(ctx, api.CoreFeaturesV1, nil).(*engine)
++	require.NotNil(t, e)
++
++	module := &wasm.Module{
++		ID:             wasm.ModuleID{0x42},
++		TypeSection:    []wasm.FunctionType{{}},
++		FunctionSection: []wasm.Index{0},
++		CodeSection:    []wasm.Code{{Body: []byte{wasm.OpcodeEnd}}},
++	}
++
++	// Create two different compiled modules
++	cm1 := &compiledModule{
++		executables: &executables{
++			executable:     []byte{0x01, 0x02, 0x03},
++			entryPreambles: []byte{0x04, 0x05},
++		},
++		functionOffsets: []int{100},
++		module:          module,
++		parent:          e,
++	}
++
++	cm2 := &compiledModule{
++		executables: &executables{
++			executable:     []byte{0x06, 0x07, 0x08},
++			entryPreambles: []byte{0x09, 0x0A},
++		},
++		functionOffsets: []int{200},
++		module:          module,
++		parent:          e,
++	}
++
++	// Add first module
++	returnedCm, err := e.addCompiledModule(module, cm1)
++	require.NoError(t, err)
++	require.Same(t, cm1, returnedCm, "Should return the first compiled module")
++
++	// Add second module (should increment ref count and return existing module)
++	returnedCm, err = e.addCompiledModule(module, cm2)
++	require.NoError(t, err)
++	require.Same(t, cm1, returnedCm, "Should return the existing compiled module, not the new one")
++
++	// Verify reference count is incremented
++	e.mux.RLock()
++	cmWithCount := e.compiledModules[module.ID]
++	require.Equal(t, 2, cmWithCount.refCount, "Reference count should be 2")
++	require.Same(t, cm1, cmWithCount.compiledModule, "Should still point to the first module")
++	e.mux.RUnlock()
++
++	// Verify the executable content is from the first module
++	retrievedCm, ok := e.getCompiledModuleFromMemory(module, false)
++	require.True(t, ok)
++	require.Equal(t, []byte{0x01, 0x02, 0x03}, retrievedCm.executables.executable)
++	require.Equal(t, []int{100}, retrievedCm.functionOffsets)
++}
++
++// TestConcurrentCompilationWithSameModule_HABITAT tests the exact race condition scenario.
++func TestConcurrentCompilationWithSameModule_HABITAT(t *testing.T) {
++	ctx := context.Background()
++	e := NewEngine(ctx, api.CoreFeaturesV1, nil).(*engine)
++	require.NotNil(t, e)
++
++	module := &wasm.Module{
++		ID:             wasm.ModuleID{0x99},
++		TypeSection:    []wasm.FunctionType{{}},
++		FunctionSection: []wasm.Index{0, 0, 0},
++		CodeSection: []wasm.Code{
++			{Body: []byte{wasm.OpcodeEnd}},
++			{Body: []byte{wasm.OpcodeEnd}},
++			{Body: []byte{wasm.OpcodeEnd}},
++		},
++	}
++
++	const numGoroutines = 20
++	var wg sync.WaitGroup
++	var results []*compiledModule
++	var mu sync.Mutex
++
++	// All goroutines try to compile the same module simultaneously
++	for i := 0; i < numGoroutines; i++ {
++		wg.Add(1)
++		go func(goroutineID int) {
++			defer wg.Done()
++
++			// Create unique compiled module for this goroutine
++			cm := &compiledModule{
++				executables: &executables{
++					executable:     make([]byte, 100),
++					entryPreambles: make([]byte, 25),
++				},
++				functionOffsets: make([]int, 3),
++				module:          module,
++				parent:          e,
++			}
++
++			// Add unique identifier to executable
++			cm.executables.executable[0] = byte(goroutineID)
++
++			// Add to cache
++			returnedCm, err := e.addCompiledModule(module, cm)
++			require.NoError(t, err)
++
++			// Store result for verification
++			mu.Lock()
++			results = append(results, returnedCm)
++			mu.Unlock()
++		}(i)
++	}
++
++	wg.Wait()
++
++	// All results should point to the same compiled module (the first one added)
++	require.Len(t, results, numGoroutines)
++	firstCm := results[0]
++	for i, cm := range results {
++		require.Same(t, firstCm, cm, "Result %d should be the same as the first result", i)
++	}
++
++	// Verify reference count is correct
++	e.mux.RLock()
++	cmWithCount := e.compiledModules[module.ID]
++	require.Equal(t, numGoroutines, cmWithCount.refCount, "Reference count should equal number of goroutines")
++	require.Same(t, firstCm, cmWithCount.compiledModule)
++	e.mux.RUnlock()
++
++	// Verify the executable content is from the first module
++	require.Equal(t, byte(0), firstCm.executables.executable[0], "Should be from goroutine 0")
++}
